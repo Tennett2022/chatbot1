@@ -26,6 +26,18 @@ anthropic>=0.28.0
 # google-generativeai>=0.7.0   # Uncomment for Gemini
 
 # ─────────────────────────────────────────────
+# Auth / Security
+# ─────────────────────────────────────────────
+# JWT is implemented with Python's standard library (hmac + hashlib).
+# No external JWT library required — avoids cryptography binary conflicts.
+# passlib[bcrypt]>=1.7.4  # Uncomment if password hashing is needed
+
+# ─────────────────────────────────────────────
+# Rate Limiting
+# ─────────────────────────────────────────────
+slowapi>=0.1.9                     # Rate limiting middleware for FastAPI
+
+# ─────────────────────────────────────────────
 # Utilities
 # ─────────────────────────────────────────────
 python-dotenv>=1.0.1

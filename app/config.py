@@ -1,8 +1,11 @@
 from pydantic_settings import BaseSettings
-from typing import Optional
+from typing import List
 
 
 class Settings(BaseSettings):
+    # App
+    APP_NAME: str = "Crovenett Chatbot API"
+    API_VERSION: str = "v1"
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
 
@@ -33,9 +36,26 @@ class Settings(BaseSettings):
     ESCALATION_PHONE: str = "+56 9 XXXX XXXX"
     MAX_HISTORY_MESSAGES: int = 10
 
+    # API Security
+    API_KEY: str = ""
+    JWT_SECRET_KEY: str = ""
+    JWT_ALGORITHM: str = "HS256"
+    JWT_EXPIRE_MINUTES: int = 1440  # 24 hours
+
+    # CORS — comma-separated list of allowed origins
+    ALLOWED_ORIGINS: str = "http://localhost:3000,https://crovenett.cl,https://www.crovenett.cl"
+
+    # Rate limiting
+    RATE_LIMIT_ENABLED: bool = True
+    RATE_LIMIT_PER_MINUTE: int = 60
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+
+    @property
+    def allowed_origins_list(self) -> List[str]:
+        return [o.strip() for o in self.ALLOWED_ORIGINS.split(",") if o.strip()]
 
 
 settings = Settings()
