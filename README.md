@@ -207,25 +207,90 @@ Para agregar un nuevo proveedor: crea un archivo en `app/llm/` que extienda `Bas
 
 ---
 
-## Integración WhatsApp
+## Activar WhatsApp — Guía por proveedor
 
-### Meta WhatsApp Cloud API (recomendado)
+El sistema soporta 4 proveedores. Elige uno y sigue los pasos.
 
-1. Crea una app en [developers.facebook.com](https://developers.facebook.com)
-2. Agrega el producto WhatsApp Business
-3. Obtén **Phone Number ID** y **Access Token**
-4. En `.env`:
-   ```env
-   WHATSAPP_PROVIDER=meta
-   WHATSAPP_TOKEN=tu_access_token
-   WHATSAPP_PHONE_NUMBER_ID=tu_phone_number_id
-   WHATSAPP_VERIFY_TOKEN=token_secreto_tuyo
-   ```
-5. Configura el webhook en Meta apuntando a `https://tu-dominio.com/webhook/whatsapp`
+### Opción A: Meta WhatsApp Cloud API (oficial, recomendado)
 
-### Otros proveedores
+**Requisitos**: cuenta de Meta for Developers, número verificado.
 
-Los stubs para Twilio, Evolution API, WATI y Z-API están en `app/channels/whatsapp_channel.py`. Implementa los métodos `_parse_X()` y `_send_X()` según la documentación de cada proveedor.
+```bash
+# 1. Configura las variables
+WHATSAPP_PROVIDER=meta
+WHATSAPP_TOKEN=EAABs...        # Access Token de tu app
+WHATSAPP_PHONE_NUMBER_ID=123456789
+WHATSAPP_VERIFY_TOKEN=mi_token_secreto   # lo inventas tú
+```
+
+**Configurar el webhook en Meta:**
+1. Ve a [developers.facebook.com](https://developers.facebook.com) → tu app → WhatsApp → Configuración
+2. Webhook URL: `https://tu-dominio.com/webhook/whatsapp`
+3. Verify Token: el mismo valor que pusiste en `WHATSAPP_VERIFY_TOKEN`
+4. Suscríbete al evento: `messages`
+
+**El código ya está listo** — `_parse_meta()` y `_send_meta()` en `whatsapp_channel.py` están implementados.
+
+---
+
+### Opción B: Evolution API (self-hosted, open source)
+
+**Requisitos**: servidor con Evolution API instalada.
+
+```bash
+WHATSAPP_PROVIDER=evolution
+WHATSAPP_TOKEN=http://tu-servidor:8080  # URL base de Evolution API
+WHATSAPP_PHONE_NUMBER_ID=nombre_instancia
+```
+
+**Pasos:**
+1. Instala Evolution API: `docker run -p 8080:8080 atendai/evolution-api`
+2. Crea una instancia y escanea el QR de WhatsApp
+3. Configura el webhook de Evolution apuntando a: `https://tu-dominio.com/webhook/whatsapp`
+4. En `app/channels/whatsapp_channel.py`, el método `_parse_evolution()` ya tiene el parser — revisa el formato exacto de tu versión de Evolution API y ajusta si es necesario.
+
+---
+
+### Opción C: WATI
+
+```bash
+WHATSAPP_PROVIDER=wati
+WHATSAPP_TOKEN=tu_api_key_de_wati
+WHATSAPP_PHONE_NUMBER_ID=tu_numero_wati
+```
+
+En `app/channels/whatsapp_channel.py`, implementa `_send_wati()`:
+```python
+async def _send_wati(self, message: OutgoingMessage) -> bool:
+    url = f"https://live-server.wati.io/api/v1/sendSessionMessage/{message.user_id}"
+    headers = {"Authorization": f"Bearer {settings.WHATSAPP_TOKEN}"}
+    payload = {"messageText": message.text}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
+        return resp.status_code == 200
+```
+
+---
+
+### Opción D: Twilio
+
+```bash
+WHATSAPP_PROVIDER=twilio
+WHATSAPP_TOKEN=tu_auth_token
+WHATSAPP_PHONE_NUMBER_ID=whatsapp:+14155238886   # número Twilio sandbox
+```
+
+Twilio envía datos `form-encoded`. El webhook de FastAPI debe recibir `Form()` en vez de JSON para este caso. Ver nota en `whatsapp_webhook.py`.
+
+---
+
+### Verificar que WhatsApp funciona
+
+```bash
+# Envía un mensaje desde tu celular al número configurado
+# Revisa los logs del servidor
+docker-compose logs -f chatbot | grep whatsapp
+```
 
 ---
 

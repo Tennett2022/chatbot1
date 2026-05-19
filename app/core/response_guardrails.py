@@ -3,72 +3,100 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Patterns the bot should never produce
-FORBIDDEN_PATTERNS = [
-    r'\$\s*\d+(?:\.\d+)?(?:\s*(?:mensuales?|anuales?|mensual|anual))?\s*(?:fijos?|exactos?)',
-    r'garantiz(?:amos?|o)\s+(?:que|el\s+resultado)',
-    r'somos?\s+(?:los?\s+)?(?:mejores?|n[uú]mero\s+uno)',
-    r'nuestros?\s+clientes?\s+(?:incluyen?|son?)\s+(?:Amazon|Google|Apple)',
-    r'certificado\s+(?:por|de)\s+(?:ISO|Google|Microsoft)',
+# ── Regex patterns that should NEVER appear in a bot response ─────────────────
+# Each tuple is (pattern, reason_label)
+FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
+    # Exact price quotes (number after price word)
+    (r'\b(cuesta|vale|cobro|cobr[ao]mos|precio\s+(?:es|ser[aá]))\s+\$?\s*\d[\d.,]*\b', "exact_price"),
+    # Fabricated guarantees
+    (r'\bgarantiz(amos|o)\s+(?:que|el\s+resultado|el\s+[eé]xito|retorno)', "fake_guarantee"),
+    # False superlatives about the company
+    (r'\b(somos|soy)\s+(?:los?\s+)?(?:mejores?|l[ií]deres?|n[uú]mero\s+1|n[uú]mero\s+uno)\s+(?:del|en\s+el)', "superlative"),
+    # Hallucinated well-known clients
+    (r'\b(Amazon|Google|Apple|Microsoft|Meta|Tesla|Netflix)\s+(es|son|fue|ha\s+sido)\s+(cliente|nuestro)', "fake_client"),
+    # Fabricated certifications
+    (r'\bcertificad[ao]s?\s+(?:por|de)\s+(ISO|Google|Microsoft|AWS|Meta)\b', "fake_cert"),
+    # Inventing specific integration names as confirmed ("tenemos integración con X" for unknown systems)
+    (r'\btenemos\s+integración\s+nativa\s+con\b', "invented_native_integration"),
 ]
 
-PRICE_INVENTION_KEYWORDS = [
-    "cuesta exactamente",
-    "el precio es",
-    "vale exactamente",
+# ── Keyword-only price invention check ───────────────────────────────────────
+# These are matched against the lowercased response.
+# NOTE: "el precio es" alone is NOT here — too broad.
+# Only trigger on patterns that unambiguously invent a closed price.
+PRICE_INVENTION_KEYWORDS: list[str] = [
+    "precio fijo de $",
+    "tarifa fija de $",
+    "cuesta exactamente $",
     "cobraremos exactamente",
-    "precio fijo de",
+    "vale exactamente $",
+    "inversión de $",          # "la inversión es de $XX"
 ]
 
-OUT_OF_SCOPE_TOPICS = [
-    "política",
-    "religión",
-    "inversiones",
-    "acciones",
-    "bolsa",
-    "receta médica",
-    "diagnóstico",
-    "asesoría legal",
-    "asesoría jurídica",
+# ── Topics completely out of Crovenett's scope ────────────────────────────────
+# Tuple of (keyword_to_detect, label_for_log, replacement_topic_label)
+OUT_OF_SCOPE_TOPICS: list[tuple[str, str]] = [
+    ("asesoría legal", "legal_advice"),
+    ("asesoría jurídica", "legal_advice"),
+    ("diagnóstico médico", "medical"),
+    ("receta médica", "medical"),
+    ("tratamiento médico", "medical"),
+    ("inversiones en bolsa", "finance"),
+    ("comprar acciones", "finance"),
+    ("criptomonedas como inversión", "finance"),
+    ("partido político", "politics"),
+    ("candidato político", "politics"),
 ]
 
 
 def check_response(response: str, intent: str) -> str:
     """
-    Apply guardrails to the bot response.
-    Returns the (possibly modified) response.
+    Apply safety guardrails to a bot response before delivery.
+
+    Checks (in order):
+    1. Forbidden regex patterns (exact prices, fake guarantees, etc.)
+    2. Price invention keywords
+    3. Out-of-scope topic detection
+
+    Returns the original response if clean, or a safe replacement.
     """
-    # Check for forbidden patterns
-    for pattern in FORBIDDEN_PATTERNS:
+    lower = response.lower()
+
+    # 1. Forbidden pattern check
+    for pattern, label in FORBIDDEN_PATTERNS:
         if re.search(pattern, response, re.IGNORECASE):
-            logger.warning("Guardrail triggered: forbidden pattern matched")
-            return _safe_fallback(intent)
+            logger.warning(f"Guardrail blocked [{label}]: matched pattern in response")
+            return _price_fallback() if "price" in label or label == "exact_price" else _generic_fallback()
 
-    # Check for price invention
+    # 2. Price invention keywords
     for keyword in PRICE_INVENTION_KEYWORDS:
-        if keyword in response.lower():
-            logger.warning(f"Guardrail triggered: price invention keyword '{keyword}'")
-            return (
-                "El valor depende del alcance de tu proyecto: canal de atención, "
-                "integraciones requeridas, volumen de conversaciones y nivel de personalización. "
-                "¿Quieres que el equipo de Crovenett te prepare una propuesta a medida?"
-            )
+        if keyword in lower:
+            logger.warning(f"Guardrail blocked [price_keyword]: '{keyword}'")
+            return _price_fallback()
 
-    # Check for out-of-scope topics
-    for topic in OUT_OF_SCOPE_TOPICS:
-        if topic in response.lower():
-            logger.warning(f"Guardrail triggered: out-of-scope topic '{topic}'")
+    # 3. Out-of-scope topics
+    for keyword, label in OUT_OF_SCOPE_TOPICS:
+        if keyword in lower:
+            logger.warning(f"Guardrail blocked [out_of_scope/{label}]: '{keyword}'")
             return (
-                "Eso está un poco fuera de mi área de conocimiento. "
-                "Me especializo en soluciones de IA, automatización y chatbots para empresas. "
-                "¿Hay algo en esa área en que te pueda ayudar?"
+                "Ese tema está fuera de mi área. Me especializo en soluciones de IA, "
+                "automatización y chatbots para empresas. ¿Te puedo orientar en algo de eso?"
             )
 
     return response
 
 
-def _safe_fallback(intent: str) -> str:
+def _price_fallback() -> str:
     return (
-        "No tengo ese dato exacto en este momento, pero puedo derivarte con el equipo de "
-        "Crovenett para que te orienten en detalle. ¿Te parece bien?"
+        "El valor depende del alcance: canal de atención, integraciones, "
+        "volumen de conversaciones y nivel de personalización. "
+        "¿Quieres que el equipo de Crovenett te prepare una propuesta a medida?"
+    )
+
+
+def _generic_fallback() -> str:
+    return (
+        "No tengo ese dato exacto en este momento. "
+        "Puedo derivarte con el equipo de Crovenett para que te orienten en detalle. "
+        "¿Te parece bien?"
     )

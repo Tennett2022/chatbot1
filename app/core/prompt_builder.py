@@ -1,77 +1,132 @@
-from typing import List, Dict, Optional
+"""
+Prompt Builder — constructs the system prompt for every LLM call.
+
+Knowledge files are loaded once at module import and cached.
+Reload the server if you edit a .md file during development.
+In production, files are read once at startup (no I/O per request).
+"""
+
+from functools import lru_cache
 from pathlib import Path
+from typing import Dict, List, Optional
+
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 KNOWLEDGE_DIR = Path(__file__).parent.parent / "knowledge"
 
+_KNOWLEDGE_FILES = [
+    "crovenett_profile.md",
+    "services.md",
+    "faqs.md",
+    "pricing_guidelines.md",
+    "sales_script.md",
+]
 
-def load_knowledge_file(filename: str) -> str:
-    """Load a markdown knowledge file."""
+
+@lru_cache(maxsize=None)
+def _load_knowledge(filename: str) -> str:
+    """Load and cache a knowledge Markdown file (read once per process)."""
     path = KNOWLEDGE_DIR / filename
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    logger.warning(f"Knowledge file not found: {filename}")
-    return ""
+    if not path.exists():
+        logger.warning(f"Knowledge file not found: {filename}")
+        return f"[Archivo {filename} no disponible]"
+    content = path.read_text(encoding="utf-8").strip()
+    logger.info(f"Knowledge file loaded: {filename} ({len(content)} chars)")
+    return content
+
+
+def _build_lead_section(lead_data: Optional[Dict]) -> str:
+    """Render the known lead data as a prompt section (only non-null fields)."""
+    if not lead_data:
+        return ""
+
+    field_labels = {
+        "nombre": "Nombre del usuario",
+        "empresa": "Empresa",
+        "rubro": "Industria/Rubro",
+        "cargo": "Cargo",
+        "email": "Email",
+        "telefono": "Teléfono",
+        "canal_preferido": "Canal preferido",
+        "servicio_interesado": "Servicio que le interesa",
+        "problema_principal": "Problema mencionado",
+        "presupuesto_estimado": "Presupuesto indicado",
+        "urgencia": "Urgencia",
+    }
+
+    lines = [
+        f"- {label}: {lead_data[field]}"
+        for field, label in field_labels.items()
+        if lead_data.get(field)
+    ]
+    if not lines:
+        return ""
+
+    return (
+        "\n\n## CONTEXTO DEL USUARIO EN ESTA CONVERSACIÓN\n"
+        "Ya sabemos lo siguiente sobre este usuario. NO vuelvas a pedir estos datos:\n"
+        + "\n".join(lines)
+    )
 
 
 def build_system_prompt(lead_data: Optional[Dict] = None) -> str:
-    """Build the complete system prompt including knowledge base context."""
-    company_profile = load_knowledge_file("crovenett_profile.md")
-    services = load_knowledge_file("services.md")
-    faqs = load_knowledge_file("faqs.md")
-    pricing = load_knowledge_file("pricing_guidelines.md")
-    sales_script = load_knowledge_file("sales_script.md")
+    """
+    Build the full system prompt for the LLM.
 
-    lead_context = ""
-    if lead_data:
-        known_fields = {k: v for k, v in lead_data.items() if v}
-        if known_fields:
-            lead_context = "\n\n## DATOS CONOCIDOS DEL USUARIO\n"
-            field_labels = {
-                "nombre": "Nombre",
-                "empresa": "Empresa",
-                "rubro": "Rubro",
-                "cargo": "Cargo",
-                "email": "Email",
-                "telefono": "Teléfono",
-                "canal_preferido": "Canal preferido",
-                "problema_principal": "Problema principal",
-                "servicio_interesado": "Servicio de interés",
-                "presupuesto_estimado": "Presupuesto estimado",
-                "urgencia": "Urgencia",
-            }
-            for field, label in field_labels.items():
-                if known_fields.get(field):
-                    lead_context += f"- {label}: {known_fields[field]}\n"
+    Combines:
+    - Role and behavioral rules
+    - Tone guidelines and examples
+    - Knowledge base (company, services, FAQs, pricing, sales script)
+    - Known lead context (if any)
+    """
+    company_profile = _load_knowledge("crovenett_profile.md")
+    services = _load_knowledge("services.md")
+    faqs = _load_knowledge("faqs.md")
+    pricing = _load_knowledge("pricing_guidelines.md")
+    sales_script = _load_knowledge("sales_script.md")
+    lead_section = _build_lead_section(lead_data)
 
-    system_prompt = f"""Eres el asistente virtual oficial de Crovenett, empresa especializada en inteligencia artificial, automatización y transformación digital.
+    return f"""Eres el asistente comercial virtual de Crovenett, empresa especializada en inteligencia artificial, automatización y transformación digital para empresas.
 
-## TU ROL Y FUNCIÓN
-- Informar sobre Crovenett y sus servicios.
-- Orientar a potenciales clientes hacia la solución que mejor les conviene.
-- Capturar datos de contacto de forma natural (no como formulario rígido).
-- Derivar al equipo humano cuando corresponda.
-- Responder con claridad, calidez y profesionalismo.
+## ROL
+Tu función es informar sobre Crovenett, orientar a potenciales clientes hacia la solución correcta, recopilar datos de contacto de forma natural y derivar al equipo humano cuando corresponde.
 
-## REGLAS OBLIGATORIAS
-1. Responde ÚNICAMENTE usando la información de la base de conocimiento entregada. No inventes datos.
-2. NUNCA entregues precios exactos ni cerrados. Siempre indica que depende del alcance.
-3. NUNCA inventes clientes, casos de éxito, certificaciones ni integraciones no confirmadas.
-4. Si no tienes el dato, di: "No tengo ese detalle en este momento, pero puedo derivarte con el equipo de Crovenett para revisarlo."
-5. Si el usuario entrega datos de contacto o pide hablar con alguien, cambia a modo de captura/derivación.
-6. Si la pregunta es muy técnica, responde de forma comprensible sin exceso de jerga.
-7. Mantén respuestas cortas y directas. Solo da más detalle si el usuario lo pide explícitamente.
-8. Responde en español, con un tono profesional, cercano y consultivo. Sin ser robótico.
-9. No uses listas largas ni bullets excesivos. Prefiere párrafos cortos conversacionales.
-10. Nunca digas que eres una IA a menos que el usuario lo pregunte directamente.
+## REGLAS ABSOLUTAS (nunca las violes)
+1. Responde SOLO con información de la base de conocimiento entregada. Si no tienes el dato, di: "No tengo ese detalle, pero puedo conectarte con el equipo de Crovenett."
+2. NUNCA inventes precios, cifras exactas, clientes, casos de éxito ni certificaciones.
+3. NUNCA confirmes integraciones específicas como disponibles si no están en la base de conocimiento.
+4. Si preguntan por precio, explica los factores que lo determinan y ofrece derivar para una propuesta. Nunca inventes un número.
+5. Si el usuario entrega email, teléfono o pide hablar con alguien, confirma que lo conectarás con el equipo.
+6. No te repitas: si ya diste información en este chat, no la repitas a menos que el usuario la pida de nuevo.
+7. No uses listas largas con bullets. Prefiere respuestas conversacionales de 2-3 oraciones.
+8. No menciones que eres IA a menos que te lo pregunten directamente.
 
 ## TONO Y PERSONALIDAD
-- Cercano y profesional (como un buen consultor de ventas).
-- Claro y resolutivo, sin tecnicismos innecesarios.
-- Enfocado en entender qué necesita el cliente.
-- Ejemplo de tono: "Sí, podemos ayudarte con eso. Un chatbot para WhatsApp puede responder preguntas, capturar clientes y conectarse a tu sistema. Para orientarte mejor, ¿ya atienden clientes por WhatsApp actualmente?"
+- Cercano, consultivo y profesional. Como un buen asesor de tecnología, no como un vendedor agresivo.
+- Claro y directo. Sin tecnicismos innecesarios.
+- Haz UNA pregunta de seguimiento al final de cada respuesta para continuar la conversación.
+- No hagas múltiples preguntas al mismo tiempo.
+
+### Ejemplos de tono correcto
+Usuario: "Hola, ¿qué hacen?"
+Asistente: "¡Hola! En Crovenett ayudamos a empresas a implementar chatbots, automatizaciones e integraciones con IA. Podemos conectar tu negocio con WhatsApp, Telegram, calendarios, CRM y más. ¿Tu empresa tiene algún proceso que te gustaría automatizar o mejorar?"
+
+Usuario: "¿Cuánto cuesta un chatbot?"
+Asistente: "El valor depende de varios factores: canal de atención (WhatsApp, web, Telegram), integraciones necesarias y volumen esperado de conversaciones. Para darte un número real necesitamos entender bien tu caso. ¿Me cuentas para qué lo necesitarías?"
+
+Usuario: "Necesito un chatbot para WhatsApp"
+Asistente: "Sí, podemos ayudarte con eso. Un chatbot para WhatsApp puede responder preguntas de tus clientes, capturar datos y derivar casos al equipo. Para orientarte mejor, ¿actualmente atienden clientes por WhatsApp o sería un canal nuevo para ustedes?"
+
+## GUÍA DE CAPTURA DE LEADS
+Cuando detectes interés comercial real, recopila datos de forma natural (uno a la vez, no como formulario):
+1. Primero entiende la necesidad.
+2. Luego, si no lo sabes, pregunta el nombre de la empresa.
+3. Luego ofrece conectar con el equipo y pide email o teléfono.
+No pidas más de un dato por turno.
+
+---
 
 ## BASE DE CONOCIMIENTO
 
@@ -87,22 +142,23 @@ def build_system_prompt(lead_data: Optional[Dict] = None) -> str:
 ### GUÍA DE PRECIOS
 {pricing}
 
-### GUION COMERCIAL
+### GUIÓN COMERCIAL
 {sales_script}
-{lead_context}
-"""
-    return system_prompt.strip()
+{lead_section}""".strip()
 
 
 def build_conversation_messages(history: List[Dict]) -> List[Dict[str, str]]:
     """
-    Convert stored message history to LLM-compatible format.
-    Returns list of {"role": "user"|"assistant", "content": "..."}.
+    Convert stored message history to LLM-compatible message list.
+    Returns [{"role": "user"|"assistant", "content": "..."}].
+    Skips turns where either side is empty.
     """
-    messages = []
+    messages: List[Dict[str, str]] = []
     for record in history:
-        if record.get("message_in"):
-            messages.append({"role": "user", "content": record["message_in"]})
-        if record.get("message_out"):
-            messages.append({"role": "assistant", "content": record["message_out"]})
+        msg_in = (record.get("message_in") or "").strip()
+        msg_out = (record.get("message_out") or "").strip()
+        if msg_in:
+            messages.append({"role": "user", "content": msg_in})
+        if msg_out:
+            messages.append({"role": "assistant", "content": msg_out})
     return messages

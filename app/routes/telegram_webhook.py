@@ -1,51 +1,96 @@
-from fastapi import APIRouter, Request, HTTPException, Header, Depends
-from typing import Optional
-from sqlalchemy.orm import Session
+import time
 from datetime import datetime
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
 from app.channels.telegram_channel import TelegramChannel
-from app.schemas.message import OutgoingMessage
+from app.config import settings
 from app.core.chatbot_engine import process_message
-from app.storage.database import get_db
-from app.storage.repositories import ConversationRepository, LeadRepository, EventLogRepository
 from app.schemas.conversation import MessageRecord
 from app.schemas.lead import LeadData
-from app.config import settings
+from app.schemas.message import OutgoingMessage
+from app.storage.database import get_db
+from app.storage.repositories import (
+    ConversationRepository,
+    EventLogRepository,
+    LeadRepository,
+)
 from app.utils.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)
 channel = TelegramChannel()
 
+# Lead schema fields we're allowed to set (excludes auto-set keys)
+_LEAD_WRITABLE_FIELDS = {
+    "nombre", "empresa", "rubro", "cargo", "email", "telefono",
+    "canal_preferido", "problema_principal", "servicio_interesado",
+    "presupuesto_estimado", "urgencia", "estado",
+}
 
-@router.post("/webhook/telegram")
+# Reject messages longer than this (spam / attack protection)
+_MAX_MESSAGE_LEN = 2000
+
+
+@router.post("/webhook/telegram", tags=["Telegram"])
 async def telegram_webhook(
     request: Request,
     x_telegram_bot_api_secret_token: Optional[str] = Header(None),
     db: Session = Depends(get_db),
 ):
-    """Receive and process Telegram webhook messages."""
-    # Validate secret token if configured
+    """
+    Receive Telegram webhook updates and process them through the chatbot engine.
+
+    Telegram calls this endpoint for every update directed at the bot.
+    Returns 200 OK immediately after processing (Telegram retries on non-200).
+    """
+    t_start = time.perf_counter()
+
+    # ── Secret token validation ────────────────────────────────────────────────
     if settings.TELEGRAM_WEBHOOK_SECRET:
         if x_telegram_bot_api_secret_token != settings.TELEGRAM_WEBHOOK_SECRET:
-            logger.warning("Invalid Telegram webhook secret token")
+            logger.warning("telegram_webhook: rejected — invalid secret token")
             raise HTTPException(status_code=403, detail="Invalid secret token")
 
-    payload = await request.json()
-    logger.debug(f"Telegram webhook received: {payload}")
+    # ── Parse JSON body ────────────────────────────────────────────────────────
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        logger.warning(f"telegram_webhook: invalid JSON body — {exc!r}")
+        # Return 200 to prevent Telegram from retrying a malformed payload
+        return JSONResponse({"ok": True, "skipped": "invalid_json"})
 
-    # Parse the incoming message
+    if not isinstance(payload, dict):
+        logger.warning("telegram_webhook: payload is not a JSON object")
+        return JSONResponse({"ok": True, "skipped": "not_an_object"})
+
+    update_id = payload.get("update_id", "?")
+    logger.debug(f"telegram_webhook: update_id={update_id}")
+
+    # ── Parse incoming message ─────────────────────────────────────────────────
     incoming = await channel.parse_incoming(payload)
     if not incoming:
-        logger.debug("Telegram payload ignored (no valid message)")
-        return {"ok": True}
+        return JSONResponse({"ok": True})  # non-text update, silently ignored
 
-    # Initialize repositories
+    # ── Basic input validation ─────────────────────────────────────────────────
+    if len(incoming.text) > _MAX_MESSAGE_LEN:
+        logger.warning(
+            f"telegram_webhook: message too long ({len(incoming.text)} chars) "
+            f"from user={incoming.user_id}, truncating"
+        )
+        incoming.text = incoming.text[:_MAX_MESSAGE_LEN]
+
+    # ── Send typing indicator (cosmetic, non-blocking) ─────────────────────────
+    await channel.send_typing_action(incoming.user_id)
+
+    # ── Load conversation context ──────────────────────────────────────────────
     conv_repo = ConversationRepository(db)
     lead_repo = LeadRepository(db)
     event_repo = EventLogRepository(db)
 
-    # Get conversation history
     history_records = conv_repo.get_recent_messages(
         incoming.user_id, "telegram", limit=settings.MAX_HISTORY_MESSAGES
     )
@@ -55,25 +100,19 @@ async def telegram_webhook(
     ]
     message_count = len(history_records)
 
-    # Get existing lead data
+    # Hydrate existing lead data
     existing_lead = lead_repo.get_lead(incoming.user_id, "telegram")
-    lead_data = {}
+    lead_data: dict = {}
     if existing_lead:
         lead_data = {
-            "nombre": existing_lead.nombre,
-            "empresa": existing_lead.empresa,
-            "rubro": existing_lead.rubro,
-            "email": existing_lead.email,
-            "telefono": existing_lead.telefono,
-            "canal_preferido": existing_lead.canal_preferido,
-            "servicio_interesado": existing_lead.servicio_interesado,
-            "urgencia": existing_lead.urgencia,
-            "estado": existing_lead.estado,
+            f: getattr(existing_lead, f)
+            for f in _LEAD_WRITABLE_FIELDS
+            if getattr(existing_lead, f, None) is not None
         }
 
-    # Process through chatbot engine
+    # ── Engine processing ──────────────────────────────────────────────────────
     try:
-        engine_response = await process_message(
+        result = await process_message(
             user_message=incoming.text,
             user_id=incoming.user_id,
             channel="telegram",
@@ -81,71 +120,114 @@ async def telegram_webhook(
             lead_data=lead_data,
             message_count=message_count,
         )
-    except Exception as e:
-        logger.error(f"Engine error for Telegram user {incoming.user_id}: {e}")
-        error_msg = OutgoingMessage(
-            user_id=incoming.user_id,
-            channel="telegram",
-            text="Tuve un problema técnico. Por favor intenta nuevamente en un momento.",
+    except Exception as exc:
+        logger.error(
+            f"telegram_webhook: engine error user={incoming.user_id} — {exc!r}",
+            exc_info=True,
         )
-        await channel.send_message(error_msg)
-        return {"ok": True}
+        fallback_text = (
+            "Tuve un inconveniente técnico. "
+            "Por favor intenta de nuevo en un momento."
+        )
+        await channel.send_message(
+            OutgoingMessage(user_id=incoming.user_id, channel="telegram", text=fallback_text)
+        )
+        return JSONResponse({"ok": True})
 
-    # Save conversation record
-    record = MessageRecord(
-        user_id=incoming.user_id,
-        channel="telegram",
-        message_in=incoming.text,
-        message_out=engine_response.response,
-        intent=engine_response.intent,
-        confidence=engine_response.confidence,
-        escalated=engine_response.should_escalate,
-        timestamp=datetime.utcnow(),
-        metadata=engine_response.metadata,
-    )
-    conv_repo.save_message(record)
+    # ── Persist conversation ───────────────────────────────────────────────────
+    try:
+        conv_repo.save_message(
+            MessageRecord(
+                user_id=incoming.user_id,
+                channel="telegram",
+                message_in=incoming.text,
+                message_out=result.response,
+                intent=result.intent,
+                confidence=result.confidence,
+                escalated=result.should_escalate,
+                timestamp=datetime.utcnow(),
+                metadata=result.metadata,
+            )
+        )
+    except Exception as exc:
+        # Storage failure should not block the response
+        logger.error(f"telegram_webhook: conversation save failed — {exc!r}", exc_info=True)
 
-    # Save/update lead data
-    if engine_response.lead_data:
-        lead_fields = {
-            k: v for k, v in engine_response.lead_data.items()
-            if k in LeadData.model_fields and k not in ("user_id", "channel", "mensaje_original")
+    # ── Persist lead data ──────────────────────────────────────────────────────
+    if result.lead_data:
+        writable = {
+            k: v for k, v in result.lead_data.items()
+            if k in _LEAD_WRITABLE_FIELDS and v is not None
         }
-        lead_schema = LeadData(
+        try:
+            lead_repo.create_or_update_lead(
+                LeadData(
+                    user_id=incoming.user_id,
+                    channel="telegram",
+                    mensaje_original=incoming.text[:500],  # cap original message
+                    **writable,
+                )
+            )
+            if result.lead_data.get("email") or result.lead_data.get("telefono"):
+                logger.info(
+                    f"telegram_webhook: lead updated user={incoming.user_id} "
+                    f"fields={list(writable.keys())}"
+                )
+        except Exception as exc:
+            logger.error(f"telegram_webhook: lead save failed — {exc!r}", exc_info=True)
+
+    # ── Log escalation event ───────────────────────────────────────────────────
+    if result.should_escalate:
+        try:
+            event_repo.log(
+                event_type="escalation",
+                user_id=incoming.user_id,
+                channel="telegram",
+                description="Conversation escalated to human agent",
+                payload={
+                    "intent": result.intent,
+                    "lead_nombre": result.lead_data.get("nombre"),
+                    "lead_empresa": result.lead_data.get("empresa"),
+                    "lead_email": result.lead_data.get("email"),
+                    "lead_telefono": result.lead_data.get("telefono"),
+                },
+            )
+        except Exception as exc:
+            logger.error(f"telegram_webhook: event log failed — {exc!r}", exc_info=True)
+
+    # ── Send reply ─────────────────────────────────────────────────────────────
+    sent = await channel.send_message(
+        OutgoingMessage(
             user_id=incoming.user_id,
             channel="telegram",
-            mensaje_original=incoming.text,
-            **lead_fields,
+            text=result.response,
         )
-        lead_repo.create_or_update_lead(lead_schema)
-
-    # Log escalation event
-    if engine_response.should_escalate:
-        event_repo.log(
-            event_type="escalation",
-            user_id=incoming.user_id,
-            channel="telegram",
-            description="User escalated to human agent",
-            payload={"intent": engine_response.intent},
-        )
-
-    # Send response
-    outgoing = OutgoingMessage(
-        user_id=incoming.user_id,
-        channel="telegram",
-        text=engine_response.response,
     )
-    success = await channel.send_message(outgoing)
-    if not success:
-        logger.error(f"Failed to send message to Telegram user {incoming.user_id}")
+    if not sent:
+        logger.error(
+            f"telegram_webhook: delivery failed to user={incoming.user_id} "
+            f"response_len={len(result.response)}"
+        )
 
-    return {"ok": True}
+    elapsed_ms = int((time.perf_counter() - t_start) * 1000)
+    logger.info(
+        f"telegram_webhook: done update_id={update_id} user={incoming.user_id} "
+        f"intent={result.intent} escalated={result.should_escalate} "
+        f"total_ms={elapsed_ms}"
+    )
+
+    return JSONResponse({"ok": True})
 
 
-@router.post("/webhook/telegram/set")
+@router.post("/webhook/telegram/set", tags=["Telegram"])
 async def set_telegram_webhook(webhook_url: str):
-    """Helper endpoint to register the Telegram webhook (dev use only)."""
+    """
+    Register a webhook URL with Telegram (development helper only).
+    Disabled when APP_ENV != 'development'.
+    """
     if settings.APP_ENV != "development":
         raise HTTPException(status_code=403, detail="Only available in development mode")
+    if not webhook_url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="Webhook URL must use HTTPS")
     success = await channel.set_webhook(webhook_url)
     return {"success": success, "webhook_url": webhook_url}

@@ -153,9 +153,9 @@ class TestResponseGuardrails(unittest.TestCase):
         self.assertNotIn("Garantizamos", result)
 
     def test_out_of_scope_blocked(self):
-        response = "Sobre política, puedo decirte que..."
+        response = "El partido político conservador tiene una postura que..."
         result = self.check_response(response, "fuera_de_alcance")
-        self.assertNotIn("política", result.lower())
+        self.assertNotIn("partido político", result.lower())
 
 
 if __name__ == "__main__":

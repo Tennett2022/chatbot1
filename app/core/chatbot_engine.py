@@ -1,26 +1,54 @@
-from typing import Dict, List, Optional
+"""
+Chatbot Engine — the core processing pipeline.
+
+Separation of concerns:
+  Channel layer  →  parses/sends messages (telegram_channel, whatsapp_channel)
+  Engine layer   →  classifies, extracts, escalates, calls LLM, applies guardrails
+  Storage layer  →  persists conversations and leads
+
+The engine knows nothing about Telegram or WhatsApp. It receives normalized
+text and returns a structured EngineResponse.
+"""
+
+import time
 from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from app.core.escalation import get_escalation_response, should_escalate
 from app.core.intent_classifier import classify_intent
 from app.core.lead_extractor import extract_lead_data, get_missing_lead_fields
-from app.core.escalation import should_escalate, get_escalation_response
+from app.core.prompt_builder import build_conversation_messages, build_system_prompt
 from app.core.response_guardrails import check_response
-from app.core.prompt_builder import build_system_prompt, build_conversation_messages
 from app.llm import get_llm_provider
+from app.llm.base_llm import BaseLLM
 from app.utils.logger import get_logger
 from app.utils.text import clean_text, truncate
 
 logger = get_logger(__name__)
 
+# Cache LLM provider — instantiated once per process, not per request.
+# If LLM_PROVIDER changes at runtime, restart the server.
+_llm_provider: Optional[BaseLLM] = None
+
+
+def _get_cached_llm() -> BaseLLM:
+    global _llm_provider
+    if _llm_provider is None:
+        _llm_provider = get_llm_provider()
+        logger.info(f"LLM provider initialized: {_llm_provider.get_provider_name()}")
+    return _llm_provider
+
 
 @dataclass
 class EngineResponse:
+    """Structured result for every processed message."""
     response: str
     intent: str
     confidence: float
     should_escalate: bool
     lead_data: Dict
     next_action: str  # "continue" | "capture_lead" | "escalate" | "farewell"
-    metadata: Optional[Dict] = None
+    metadata: Dict = field(default_factory=dict)
 
 
 async def process_message(
@@ -32,81 +60,123 @@ async def process_message(
     message_count: int = 0,
 ) -> EngineResponse:
     """
-    Core chatbot engine: processes a user message and returns a structured response.
+    Process a single user message through the full chatbot pipeline.
+
+    Pipeline:
+      1. Sanitize input
+      2. Classify intent
+      3. Extract new lead fields (non-destructive: won't overwrite existing data)
+      4. Check escalation conditions (before LLM to save tokens when escalating)
+      5. Build system prompt (with cached knowledge base)
+      6. Generate LLM response (with timing log)
+      7. Apply safety guardrails
+      8. Determine next action
 
     Args:
-        user_message: The raw text from the user.
-        user_id: Unique user identifier (from the channel).
-        channel: Source channel (telegram | whatsapp | web).
-        history: Recent conversation history (list of {message_in, message_out}).
-        lead_data: Known lead information for this user.
-        message_count: Total messages in this conversation.
+        user_message:  Raw text from the user.
+        user_id:       Channel-specific user identifier.
+        channel:       Source channel name ("telegram" | "whatsapp" | "web").
+        history:       Last N conversation turns [{message_in, message_out}].
+        lead_data:     Accumulated lead fields from previous turns.
+        message_count: Number of completed turns in this conversation.
 
     Returns:
-        EngineResponse with all relevant fields.
+        EngineResponse — never raises; errors produce a safe fallback response.
     """
     lead_data = lead_data or {}
-    cleaned_message = clean_text(user_message)
+    t_start = time.perf_counter()
 
-    # 1. Classify intent
-    intent, confidence = classify_intent(cleaned_message)
-    logger.info(f"[{channel}] user={user_id} intent={intent} confidence={confidence:.2f}")
+    # 1. Sanitize
+    cleaned = clean_text(user_message)
+    if not cleaned:
+        return EngineResponse(
+            response="No recibí ningún mensaje. ¿En qué te puedo ayudar?",
+            intent="fuera_de_alcance",
+            confidence=0.0,
+            should_escalate=False,
+            lead_data=lead_data,
+            next_action="continue",
+        )
 
-    # 2. Extract lead data from this message
-    new_lead_fields = extract_lead_data(cleaned_message, existing=lead_data)
-    merged_lead = {**lead_data, **new_lead_fields}
+    # 2. Intent classification
+    intent, confidence = classify_intent(cleaned)
+    logger.info(
+        f"intent channel={channel} user={user_id} intent={intent} "
+        f"conf={confidence:.2f} msg_len={len(cleaned)}"
+    )
 
-    # 3. Check escalation
-    escalate = should_escalate(intent, cleaned_message, merged_lead, message_count)
+    # 3. Lead extraction (pass existing data so extractor skips already-known fields)
+    new_fields = extract_lead_data(cleaned, existing=lead_data)
+    # Merge: existing values are preserved; new fields fill the gaps
+    merged_lead = {**lead_data, **{k: v for k, v in new_fields.items() if v is not None}}
 
-    if escalate:
-        escalation_response = get_escalation_response(merged_lead)
+    # 4. Escalation check (short-circuit before LLM)
+    if should_escalate(intent, cleaned, merged_lead, message_count):
+        escalation_text = get_escalation_response(merged_lead)
+        # Mark lead as pending contact if we already have contact info
         if merged_lead.get("email") or merged_lead.get("telefono"):
             merged_lead["estado"] = "pendiente_contacto"
+        logger.info(f"escalation channel={channel} user={user_id} intent={intent}")
         return EngineResponse(
-            response=escalation_response,
+            response=escalation_text,
             intent=intent,
             confidence=confidence,
             should_escalate=True,
             lead_data=merged_lead,
             next_action="escalate",
+            metadata={"escalation_intent": intent},
         )
 
-    # 4. Build LLM prompt and conversation
+    # 5. Build LLM context
     system_prompt = build_system_prompt(lead_data=merged_lead)
-    conversation_messages = build_conversation_messages(history)
+    conv_messages = build_conversation_messages(history)
+    conv_messages.append({"role": "user", "content": cleaned})
 
-    # Add current message
-    conversation_messages.append({"role": "user", "content": cleaned_message})
-
-    # 5. Generate LLM response
+    # 6. LLM generation
+    llm_error: Optional[str] = None
+    t_llm = time.perf_counter()
     try:
-        llm = get_llm_provider()
+        llm = _get_cached_llm()
         raw_response = await llm.generate_response(
             system_prompt=system_prompt,
-            messages=conversation_messages,
+            messages=conv_messages,
             max_tokens=600,
             temperature=0.7,
         )
-    except Exception as e:
-        logger.error(f"LLM error for user={user_id}: {e}")
+        logger.info(
+            f"llm_call provider={llm.get_provider_name()} "
+            f"elapsed_ms={int((time.perf_counter() - t_llm) * 1000)} "
+            f"user={user_id}"
+        )
+    except Exception as exc:
+        logger.error(
+            f"llm_error channel={channel} user={user_id} error={exc!r}",
+            exc_info=True,
+        )
+        llm_error = str(exc)
         raw_response = (
-            "En este momento tengo un inconveniente técnico. "
-            "Por favor intenta nuevamente en un momento, o puedo derivarte con el equipo de Crovenett."
+            "Tuve un inconveniente técnico en este momento. "
+            "Puedes intentar de nuevo, o si prefieres te conecto con el equipo de Crovenett."
         )
 
-    # 6. Apply guardrails
+    # 7. Guardrails
     safe_response = check_response(raw_response, intent)
     final_response = truncate(safe_response, 4000)
 
-    # 7. Determine next action
-    missing_fields = get_missing_lead_fields(merged_lead)
+    # 8. Next action
+    missing = get_missing_lead_fields(merged_lead)
     if intent == "despedida":
         next_action = "farewell"
-    elif len(missing_fields) > 0 and intent in {"cliente_interesado", "precios", "agendar_reunion"}:
+    elif missing and intent in {"cliente_interesado", "precios", "agendar_reunion"}:
         next_action = "capture_lead"
     else:
         next_action = "continue"
+
+    total_ms = int((time.perf_counter() - t_start) * 1000)
+    logger.info(
+        f"engine_done channel={channel} user={user_id} "
+        f"action={next_action} total_ms={total_ms}"
+    )
 
     return EngineResponse(
         response=final_response,
@@ -115,5 +185,9 @@ async def process_message(
         should_escalate=False,
         lead_data=merged_lead,
         next_action=next_action,
-        metadata={"missing_lead_fields": missing_fields},
+        metadata={
+            "missing_lead_fields": missing,
+            "llm_error": llm_error,
+            "total_ms": total_ms,
+        },
     )
