@@ -18,7 +18,11 @@ from app.core.escalation import get_escalation_response, should_escalate
 from app.core.intent_classifier import classify_intent
 from app.core.lead_extractor import extract_lead_data, get_missing_lead_fields
 from app.core.prompt_builder import build_conversation_messages, build_system_prompt
-from app.core.response_guardrails import check_response
+from app.core.response_guardrails import (
+    check_response,
+    is_out_of_scope,
+    scope_redirect_response,
+)
 from app.llm import get_llm_provider
 from app.llm.base_llm import BaseLLM
 from app.utils.logger import get_logger
@@ -98,19 +102,31 @@ async def process_message(
             next_action="continue",
         )
 
-    # 2. Intent classification
+    # 2. Out-of-scope pre-check (avoids LLM call for clearly off-topic messages)
+    if is_out_of_scope(cleaned):
+        logger.info(f"scope_blocked channel={channel} user={user_id} msg_len={len(cleaned)}")
+        return EngineResponse(
+            response=scope_redirect_response(),
+            intent="fuera_de_alcance",
+            confidence=1.0,
+            should_escalate=False,
+            lead_data=lead_data,
+            next_action="continue",
+        )
+
+    # 3. Intent classification
     intent, confidence = classify_intent(cleaned)
     logger.info(
         f"intent channel={channel} user={user_id} intent={intent} "
         f"conf={confidence:.2f} msg_len={len(cleaned)}"
     )
 
-    # 3. Lead extraction (pass existing data so extractor skips already-known fields)
+    # 4. Lead extraction (pass existing data so extractor skips already-known fields)
     new_fields = extract_lead_data(cleaned, existing=lead_data)
     # Merge: existing values are preserved; new fields fill the gaps
     merged_lead = {**lead_data, **{k: v for k, v in new_fields.items() if v is not None}}
 
-    # 4. Escalation check (short-circuit before LLM)
+    # 5. Escalation check (short-circuit before LLM)
     if should_escalate(intent, cleaned, merged_lead, message_count):
         escalation_text = get_escalation_response(merged_lead)
         # Mark lead as pending contact if we already have contact info
@@ -127,12 +143,12 @@ async def process_message(
             metadata={"escalation_intent": intent},
         )
 
-    # 5. Build LLM context
+    # 6. Build LLM context
     system_prompt = build_system_prompt(lead_data=merged_lead)
     conv_messages = build_conversation_messages(history)
     conv_messages.append({"role": "user", "content": cleaned})
 
-    # 6. LLM generation
+    # 7. LLM generation
     llm_error: Optional[str] = None
     t_llm = time.perf_counter()
     try:
@@ -159,11 +175,11 @@ async def process_message(
             "Puedes intentar de nuevo, o si prefieres te conecto con el equipo de Crovenett."
         )
 
-    # 7. Guardrails
+    # 8. Guardrails
     safe_response = check_response(raw_response, intent)
     final_response = truncate(safe_response, 4000)
 
-    # 8. Next action
+    # 9. Next action
     missing = get_missing_lead_fields(merged_lead)
     if intent == "despedida":
         next_action = "farewell"

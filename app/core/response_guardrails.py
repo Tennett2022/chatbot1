@@ -3,6 +3,14 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# ── Redirect message used when the bot goes off-scope ────────────────────────
+_SCOPE_REDIRECT = (
+    "Puedo ayudarte solo con información sobre Crovenett, sus soluciones de "
+    "inteligencia artificial, automatización, chatbots, voicebots, integraciones "
+    "y servicios comerciales. Si quieres, puedo contarte qué soluciones ofrecemos "
+    "o ayudarte a identificar cuál podría servirle a tu empresa."
+)
+
 # ── Regex patterns that should NEVER appear in a bot response ─────────────────
 # Each tuple is (pattern, reason_label)
 FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
@@ -16,37 +24,92 @@ FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
     (r'\b(Amazon|Google|Apple|Microsoft|Meta|Tesla|Netflix)\s+(es|son|fue|ha\s+sido)\s+(cliente|nuestro)', "fake_client"),
     # Fabricated certifications
     (r'\bcertificad[ao]s?\s+(?:por|de)\s+(ISO|Google|Microsoft|AWS|Meta)\b', "fake_cert"),
-    # Inventing specific integration names as confirmed ("tenemos integración con X" for unknown systems)
+    # Inventing specific integration names as confirmed
     (r'\btenemos\s+integración\s+nativa\s+con\b', "invented_native_integration"),
 ]
 
 # ── Keyword-only price invention check ───────────────────────────────────────
-# These are matched against the lowercased response.
-# NOTE: "el precio es" alone is NOT here — too broad.
-# Only trigger on patterns that unambiguously invent a closed price.
 PRICE_INVENTION_KEYWORDS: list[str] = [
     "precio fijo de $",
     "tarifa fija de $",
     "cuesta exactamente $",
     "cobraremos exactamente",
     "vale exactamente $",
-    "inversión de $",          # "la inversión es de $XX"
+    "inversión de $",
 ]
 
-# ── Topics completely out of Crovenett's scope ────────────────────────────────
-# Tuple of (keyword_to_detect, label_for_log, replacement_topic_label)
+# ── Out-of-scope topic detection ──────────────────────────────────────────────
+# Used both to catch off-scope LLM responses and to short-circuit clearly
+# off-topic user messages before calling the LLM.
+# Tuple: (keyword_in_lowercase, category_label)
 OUT_OF_SCOPE_TOPICS: list[tuple[str, str]] = [
-    ("asesoría legal", "legal_advice"),
-    ("asesoría jurídica", "legal_advice"),
+    # Politics
+    ("partido político", "politics"),
+    ("candidato político", "politics"),
+    ("elecciones presidenciales", "politics"),
+    ("gobierno de", "politics"),
+    # Health / medicine
+    ("asesoría médica", "medical"),
     ("diagnóstico médico", "medical"),
     ("receta médica", "medical"),
     ("tratamiento médico", "medical"),
+    ("síntomas de", "medical"),
+    ("hazme una dieta", "medical"),
+    ("plan de dieta", "medical"),
+    # Legal
+    ("asesoría legal", "legal"),
+    ("asesoría jurídica", "legal"),
+    ("consejo legal", "legal"),
+    ("demanda judicial", "legal"),
+    # Finance / investments
     ("inversiones en bolsa", "finance"),
     ("comprar acciones", "finance"),
     ("criptomonedas como inversión", "finance"),
-    ("partido político", "politics"),
-    ("candidato político", "politics"),
+    ("fondos de inversión", "finance"),
+    # Generic programming / tutorials
+    ("explícame python", "generic_tech"),
+    ("explícame javascript", "generic_tech"),
+    ("cómo programar en", "generic_tech"),
+    ("tutorial de programación", "generic_tech"),
+    # School / homework
+    ("tarea escolar", "homework"),
+    ("ayúdame con la tarea", "homework"),
+    ("resumen del libro", "homework"),
+    # Entertainment / culture
+    ("quién ganó las elecciones", "off_topic"),
+    ("recomiéndame una película", "off_topic"),
+    ("recomiéndame un restaurante", "off_topic"),
 ]
+
+# ── User-message pre-check ────────────────────────────────────────────────────
+# Patterns that unambiguously indicate a fully off-topic message.
+# Only triggers when there is NO Crovenett-related keyword alongside.
+_CROVENETT_SIGNALS = re.compile(
+    r'\b(chatbot|bot|whatsapp|telegram|automatiz|crovenett|ia|inteligencia\s*artificial|'
+    r'crm|integraci[oó]n|precio|costo|servicio|solución|lead|ventas|asesor|agente|'
+    r'voicebot|dashboard|reporte|api)\b',
+    re.IGNORECASE,
+)
+
+
+def is_out_of_scope(user_message: str) -> bool:
+    """
+    Return True when the user message is ENTIRELY off-topic (no Crovenett signal).
+    Mixed messages (off-topic + Crovenett) return False — the LLM handles those.
+    """
+    lower = user_message.lower()
+    has_scope_signal = bool(_CROVENETT_SIGNALS.search(user_message))
+    if has_scope_signal:
+        return False  # mixed question — let the LLM respond
+    for keyword, _ in OUT_OF_SCOPE_TOPICS:
+        if keyword in lower:
+            return True
+    return False
+
+
+def scope_redirect_response() -> str:
+    """Standard redirection response for fully off-topic messages."""
+    return _SCOPE_REDIRECT
 
 
 def check_response(response: str, intent: str) -> str:
@@ -56,7 +119,7 @@ def check_response(response: str, intent: str) -> str:
     Checks (in order):
     1. Forbidden regex patterns (exact prices, fake guarantees, etc.)
     2. Price invention keywords
-    3. Out-of-scope topic detection
+    3. Out-of-scope topic detection in the LLM's output
 
     Returns the original response if clean, or a safe replacement.
     """
@@ -74,14 +137,11 @@ def check_response(response: str, intent: str) -> str:
             logger.warning(f"Guardrail blocked [price_keyword]: '{keyword}'")
             return _price_fallback()
 
-    # 3. Out-of-scope topics
+    # 3. Out-of-scope content in LLM output
     for keyword, label in OUT_OF_SCOPE_TOPICS:
         if keyword in lower:
             logger.warning(f"Guardrail blocked [out_of_scope/{label}]: '{keyword}'")
-            return (
-                "Ese tema está fuera de mi área. Me especializo en soluciones de IA, "
-                "automatización y chatbots para empresas. ¿Te puedo orientar en algo de eso?"
-            )
+            return _SCOPE_REDIRECT
 
     return response
 
